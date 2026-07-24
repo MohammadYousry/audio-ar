@@ -120,22 +120,52 @@ export default function App() {
     }
   }, [audioUrl]);
 
+  // يستخرج مدة الانتظار المقترحة (بالثواني) من رسالة الخطأ عند تجاوز الحصة (429)
+  const extractRetryDelaySeconds = (err: any): number | null => {
+    const raw = err?.message || (typeof err === 'string' ? err : JSON.stringify(err ?? ''));
+    const match = raw.match(/retry(?:Delay)?["'\s:]*(\d+(?:\.\d+)?)\s*s/i)
+      || raw.match(/retry in\s*(\d+(?:\.\d+)?)\s*s/i);
+    return match ? Math.ceil(parseFloat(match[1])) : null;
+  };
+
+  const isRateLimitError = (err: any): boolean => {
+    const raw = err?.message || (typeof err === 'string' ? err : JSON.stringify(err ?? ''));
+    return raw.includes('429') || raw.includes('RESOURCE_EXHAUSTED') || raw.includes('quota');
+  };
+
+  const sleep = (ms: number) => new Promise(res => setTimeout(res, ms));
+
   const generateAudio = async (textToSpeak: string, selectedVoice: string): Promise<string> => {
     const instructionStr = "أنت خبير في التعليق الصوتي (Voice Over) باللغة العربية الفصحى. مهمتك هي تحويل النص المكتوب إلى صوت بشري طبيعي واحترافي تماماً، يراعي القواعد اللغوية بدقة عالية.\n\nالقواعد الصوتية الإلزامية:\n- نطق حرف (ج): يجب نطق الجيم المعطشة الفصحى بشكل واضح.\n- نطق الثاء والذال والظاء: يجب إخراج الحروف اللثوية من مخارجها الصحيحة.\n- المدود (آ): مراعاة المدود الطويلة والقصيرة بشكل طبيعي غير متكلف.\n- الوقفات (Pauses): الالتزام بوقفات تنفس طبيعية عند الفواصل ونهاية الجمل.\n- التشكيل: الالتزام التام بنطق الحركات (الفتحة، الضمة، الكسرة، والتنوين) لضمان الفصاحة.\n\nقم بقراءة النص التالي بناء على التعليمات السابقة:\n";
-    
-    const response = await ai.models.generateContent({
-      model: "gemini-3.1-flash-tts-preview",
-      contents: [{ parts: [{ text: instructionStr + textToSpeak }] }],
-      config: {
-        responseModalities: ["AUDIO"] as any,
-        temperature: 0.6,
-        speechConfig: {
-          voiceConfig: {
-            prebuiltVoiceConfig: { voiceName: selectedVoice as any },
+
+    // إعادة المحاولة تلقائياً عند تجاوز الحصة (429)، مع احترام مدة الانتظار التي يرجعها الخادم
+    const MAX_RETRIES = 2;
+    let response: any;
+    for (let attempt = 0; ; attempt++) {
+      try {
+        response = await ai.models.generateContent({
+          model: "gemini-3.1-flash-tts-preview",
+          contents: [{ parts: [{ text: instructionStr + textToSpeak }] }],
+          config: {
+            responseModalities: ["AUDIO"] as any,
+            temperature: 0.6,
+            speechConfig: {
+              voiceConfig: {
+                prebuiltVoiceConfig: { voiceName: selectedVoice as any },
+              },
+            },
           },
-        },
-      },
-    });
+        });
+        break;
+      } catch (err: any) {
+        if (isRateLimitError(err) && attempt < MAX_RETRIES) {
+          const waitSec = extractRetryDelaySeconds(err) ?? (5 * (attempt + 1));
+          await sleep(waitSec * 1000 + 500);
+          continue;
+        }
+        throw err;
+      }
+    }
 
     const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
     if (base64Audio) {
@@ -177,7 +207,10 @@ export default function App() {
     } catch (err: any) {
       console.error("Preview generation failed:", err);
       let msg = err.message || 'حدث خطأ أثناء تحميل المعاينة.';
-      if (msg.includes('403') || msg.includes('PERMISSION_DENIED')) {
+      if (isRateLimitError(err)) {
+        const waitSec = extractRetryDelaySeconds(err);
+        msg = `تم تجاوز حد الاستخدام المجاني (429): الخطة المجانية تسمح بعدد محدود من الطلبات في الدقيقة.${waitSec ? ` يرجى الانتظار حوالي ${waitSec} ثانية ثم إعادة المحاولة.` : ' يرجى الانتظار قليلاً ثم إعادة المحاولة.'} لرفع الحد، فعّل الفوترة على مفتاح الـ API الخاص بك.`;
+      } else if (msg.includes('403') || msg.includes('PERMISSION_DENIED')) {
         msg = 'خطأ في الصلاحيات (403): يبدو أن مفتاح الـ API الحالي لا يدعم ميزة تحويل النص لصوت. يرجى التأكد من تفعيل الميزة في إعدادات Gemini أو استخدام مفتاح API خاص بك.';
       }
       setError(msg);
@@ -205,7 +238,10 @@ export default function App() {
     } catch (err: any) {
       console.error("Audio generation failed:", err);
       let msg = err.message || 'حدث خطأ غير متوقع أثناء المعالجة الصوتية.';
-      if (msg.includes('403') || msg.includes('PERMISSION_DENIED')) {
+      if (isRateLimitError(err)) {
+        const waitSec = extractRetryDelaySeconds(err);
+        msg = `تم تجاوز حد الاستخدام المجاني (429): الخطة المجانية تسمح بعدد محدود من الطلبات في الدقيقة.${waitSec ? ` يرجى الانتظار حوالي ${waitSec} ثانية ثم إعادة المحاولة.` : ' يرجى الانتظار قليلاً ثم إعادة المحاولة.'} لرفع الحد، فعّل الفوترة على مفتاح الـ API الخاص بك.`;
+      } else if (msg.includes('403') || msg.includes('PERMISSION_DENIED')) {
         msg = 'خطأ في الصلاحيات (403): النموذج التجريبي للصوت يتطلب صلاحيات إضافية. يرجى استخدام مفتاح API خاص (Settings > Secrets) يدعم نماذج Gemini 3.1 Flash TTS.';
       }
       setError(msg);
